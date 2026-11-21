@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+tia_to_nodeset.py
+=================
+Unterstützter Input:
+  1. TIA XML-Export von Global-DBs:  SW.Blocks.GlobalDB
+  2. TIA XML-Export von PLC-Datentypen (UDT): SW.Types.PlcStruct / SW.Types.PlcUDT
+  3. Ordner mit mehreren solchen XML-Dateien
+  4. Fallback: einfache CSV-Tagliste (Name;Datentyp;Kommentar)
+
+Verwendung:
+  python tia_to_nodeset.py --input ./tia_export --namespace "http://siemens.com/tia/meine-anlage" --output MyModel.NodeSet2.xml
+  python tia_to_nodeset.py --input MeinDB.xml --output MeinDB.NodeSet2.xml --plc-name "S7-1500"
+  python tia_to_nodeset.py --input tags.csv --output Tags.NodeSet2.xml
+
+TIA-Export in TIA Portal erzeugen:
+  Projektbaum > PLC > Datenbausteine / PLC-Datentypen > Rechtsklick > Exportieren > Als XML exportieren.
+  Diesen Ordner dann als --input übergeben.
+
+SIOME-Import:
+  SIOME > Information Model > Import XML > erzeugte NodeSet2.xml wählen.
+  Danach Namespace prüfen, Modell speichern und z.B. als Server-Interface für S7-1500 nutzen.
+
+import argparse
+import csv
+import datetime
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 1. Siemens -> OPC UA Datentyp-Mapping
+# ---------------------------------------------------------------------------
+
+SIEMENS_TO_OPCUA = {
+    "BOOL": ("Boolean", "i=1"),
+    "BYTE": ("Byte", "i=3"),
+    "WORD": ("UInt16", "i=5"),
+    "DWORD": ("UInt32", "i=7"),
+    "LWORD": ("UInt64", "i=9"),
+    "SINT": ("SByte", "i=2"),
+    "INT": ("Int16", "i=4"),
+    "DINT": ("Int32", "i=6"),
+    "LINT": ("Int64", "i=8"),
+    "USINT": ("Byte", "i=3"),
+    "UINT": ("UInt16", "i=5"),
+    "UDINT": ("UInt32", "i=7"),
+    "ULINT": ("UInt64", "i=9"),
+    "REAL": ("Float", "i=10"),
+    "LREAL": ("Double", "i=11"),
+    "STRING": ("String", "i=12"),
+    "WSTRING": ("String", "i=12"),
+    "WCHAR": ("String", "i=12"),
+    "CHAR": ("String", "i=12"),
+    "DATE": ("DateTime", "i=13"),
+    "TIME": ("Duration", "i=290"),       # Duration = Double in OPC UA
+    "LTIME": ("Duration", "i=290"),
+    "S5TIME": ("Duration", "i=290"),
+    "TOD": ("DateTime", "i=13"),         # TimeOfDay -> DateTime
+    "LTOD": ("DateTime", "i=13"),
+    "DT": ("DateTime", "i=13"),
+    "DTL": ("DateTime", "i=13"),
+    "DATE_AND_TIME": ("DateTime", "i=13"),
+}
+
+# Aliase für NodeSet2.xml
+ALIASES = {
+    "Boolean": "i=1",
+    "SByte": "i=2",
+    "Byte": "i=3",
+    "Int16": "i=4",
+    "UInt16": "i=5",
+    "Int32": "i=6",
+    "UInt32": "i=7",
+    "Int64": "i=8",
+    "UInt64": "i=9",
+    "Float": "i=10",
+    "Double": "i=11",
+    "String": "i=12",
+    "DateTime": "i=13",
+    "Duration": "i=290",
+    "HasTypeDefinition": "i=40",
+    "HasComponent": "i=33",
+    "HasProperty": "i=34",
+    "Organizes": "i=35",
+    "HasSubtype": "i=45",
+    "BaseObjectType": "i=58",
+    "BaseDataVariableType": "i=63",
+    "Structure": "i=22",
+}
+
+ARRAY_RE = re.compile(r"Array\s*\[\s*(-?\d+)\s*\.\.\s*(-?\d+)(?:\s*,\s*-?\d+\s*\.\.\s*-?\d+\s*)*\s*\]\s*[Oo]f\s+(.+)", re.IGNORECASE)
+
+
+def strip_ns(tag: str) -> str:
+    """Entfernt XML-Namespace und TIA-Präfix (z.B. SW.Blocks.GlobalDB -> GlobalDB)."""
+    if "}" in tag:
+        tag = tag.split("}", 1)[-1]
+    # TIA SIMATIC ML nutzt Punkte: SW.Blocks.GlobalDB, SW.Types.PlcStruct
+    if "." in tag:
+        tag = tag.split(".")[-1]
+    return tag
+
+
+def map_datatype(siemens_type: str):
+    """
+    Gibt (opc_name, opc_nodeid, is_array, array_dim, base_type_name) zurück.
+    Beispiel: 'Array[0..9] of Real' -> ('Float', 'i=10', True, '10', 'REAL')
+    Beispiel: '"MyUDT"' -> ('MyUDT', 'ns=1-UDT', False, None, 'MyUDT') -> wird später aufgelöst
+    """
+    t = (siemens_type or "").strip().strip('"').strip("'")
+    m = ARRAY_RE.match(t)
+    is_array = False
+    array_dim = None
+    if m:
+        try:
+            lo = int(m.group(1))
+            hi = int(m.group(2))
+            array_dim = str(max(1, hi - lo + 1))
+        except Exception:
+            array_dim = None
+        is_array = True
+        t = m.group(3).strip().strip('"').strip("'")
+
+    base_upper = t.upper()
+    # UDT / Struct / benutzerdefiniert?
+    if base_upper.startswith("UDT_") or base_upper.startswith('"UDT'):
+        clean = t.strip('"')
+        return (clean, None, is_array, array_dim, clean)
+    if base_upper in SIEMENS_TO_OPCUA:
+        opc_name, opc_id = SIEMENS_TO_OPCUA[base_upper]
+        return (opc_name, opc_id, is_array, array_dim, base_upper)
+    # Unbekannt: Struct, benutzerdefinierter Typname, Enum, etc.
+    if base_upper in ("STRUCT", "ARRAY"):
+        return ("Structure", None, is_array, array_dim, t)
+    # Fallback: als String behandeln, Originalnamen merken (kann UDT sein)
+    clean = t.strip('"')
+    if clean and clean.upper() not in SIEMENS_TO_OPCUA and len(clean) <= 64 and re.match(r"^[\w_][\w\d_]*$", clean):
+        # Vermutlich UDT-/Enum-Name -> später als DataType-Referenz auflösen
+        return (clean, None, is_array, array_dim, clean)
+    return ("String", "i=12", is_array, array_dim, t)
+
+
+# ---------------------------------------------------------------------------
+# 2. TIA XML parsen (SIMATIC ML)
+# ---------------------------------------------------------------------------
+
+def find_members_recursive(member_el):
+    """Liest ein <Member>-Element inkl. verschachtelter <Member> ein."""
+    name = member_el.get("Name", "Unnamed")
+    datatype = member_el.get("Datatype", "String")
+    # Externe Sichtbarkeit (für OPC UA relevant)
+    accessible = True
+    writable = True
+    comment = ""
+    for child in member_el:
+        n = strip_ns(child.tag)
+        if n == "AttributeList":
+            for attr in child:
+                an = strip_ns(attr.tag)
+                # <BooleanAttribute Name="ExternalAccessible" SystemDefined="true">true</...>
+                if an == "BooleanAttribute":
+                    aname = attr.get("Name", "")
+                    val = (attr.text or "").strip().lower() == "true"
+                    if aname == "ExternalAccessible":
+                        accessible = val
+                    if aname == "ExternalWritable":
+                        writable = val
+                if an == "StringAttribute" and attr.get("Name") == "Comment":
+                    # Kann verschachtelt sein
+                    comment = "".join(attr.itertext()).strip()
+        if n in ("Sections", "Section", "Member"):
+            pass
+    # Verschachtelte Member suchen: <Member><Sections><Section><Member .../>...
+    children = []
+    for sec in member_el.iter():
+        # Nur direkte Kinder-Ebenen einsammeln, keine doppelten
+        pass
+    # Gezielt: alle direkten <Section>/<Member> unter diesem <Member>
+    for child in list(member_el):
+        cn = strip_ns(child.tag)
+        if cn == "Sections":
+            for sec in list(child):
+                if strip_ns(sec.tag) == "Section":
+                    for mm in list(sec):
+                        if strip_ns(mm.tag) == "Member":
+                            children.append(parse_member(mm))
+        elif cn == "Section":
+            for mm in list(child):
+                if strip_ns(mm.tag) == "Member":
+                    children.append(parse_member(mm))
+    return {"name": name, "datatype": datatype, "accessible": accessible,
+            "writable": writable, "comment": comment, "children": children}
+
+
+def parse_member(member_el):
+    return find_members_recursive(member_el)
+
+
+def parse_tia_file(path: Path):
+    """
+    Parst eine TIA-Export-XML.
+    Rückgabe: (db_list, udt_list)
+      db_list:  [{name, members:[...]}]
+      udt_list: [{name, members:[...]}]
+    """
+    try:
+        tree = ET.parse(str(path))
+    except ET.ParseError as e:
+        print(f"[WARN] {path.name}: kein gültiges XML ({e}) – übersprungen", file=sys.stderr)
+        return [], []
+    root = tree.getroot()
+
+    dbs = []
+    udts = []
+
+    for el in root.iter():
+        tag = strip_ns(el.tag)
+        # GlobalDB: <SW.Blocks.GlobalDB>
+        if tag == "GlobalDB":
+            name = "UnnamedDB"
+            # Name aus AttributeList
+            for child in el:
+                if strip_ns(child.tag) == "AttributeList":
+                    for a in child:
+                        if strip_ns(a.tag) == "Name":
+                            name = (a.text or "").strip() or name
+                        # Manche Exporte: <StringAttribute Name="Name">
+                        if strip_ns(a.tag) == "StringAttribute" and a.get("Name") == "Name":
+                            name = (a.text or "").strip() or name
+            # Interface > Sections > Section > Member
+            members = []
+            for iface in el:
+                if strip_ns(iface.tag) == "Interface":
+                    for secs in iface:
+                        if strip_ns(secs.tag) == "Sections":
+                            for sec in secs:
+                                if strip_ns(sec.tag) == "Section":
+                                    for mm in sec:
+                                        if strip_ns(mm.tag) == "Member":
+                                            members.append(parse_member(mm))
+            # Fallback: Name aus Dateiname
+            if name == "UnnamedDB":
+                name = path.stem
+            dbs.append({"name": name, "members": members, "source": path.name})
+
+        # PLC-Datentyp: <SW.Types.PlcStruct>, PlcUDT, ControllerDataType etc.
+        if tag in ("PlcStruct", "PlcUDT", "ControllerDataType", "PlcType"):
+            name = el.get("Name", "")
+            if not name:
+                for child in el:
+                    if strip_ns(child.tag) == "AttributeList":
+                        for a in child:
+                            if strip_ns(a.tag) == "Name":
+                                name = (a.text or "").strip()
+            if not name:
+                name = path.stem
+            members = []
+            for iface in el:
+                if strip_ns(iface.tag) == "Interface":
+                    for secs in iface:
+                        if strip_ns(secs.tag) == "Sections":
+                            for sec in secs:
+                                if strip_ns(sec.tag) == "Section":
+                                    for mm in sec:
+                                        if strip_ns(mm.tag) == "Member":
+                                            members.append(parse_member(mm))
+            # Auch direkte Member ohne Interface (manche Versionen)
+            if not members:
+                for mm in el.iter():
+                    if strip_ns(mm.tag) == "Member" and mm is not el:
+                        # Nur Top-Level (Eltern ist Section) – vereinfacht: alle, Duplikate vermeiden
+                        break
+            if name:
+                udts.append({"name": name, "members": members, "source": path.name})
+
+    return dbs, udts
+
+
+def parse_csv_tags(path: Path):
+    """Fallback: CSV mit Spalten Name;Datentyp;Kommentar (Header optional)."""
+    members = []
+    with open(path, encoding="utf-8-sig") as f:
+        sample = f.read(2048)
+        f.seek(0)
+        delim = ";" if ";" in sample else ","
+        reader = csv.reader(f, delimiter=delim)
+        rows = list(reader)
+    # Header erkennen
+    start = 0
+    if rows and any(h.lower() in ("name", "tag", "variablenname", "datentyp", "datatype", "typ") for h in rows[0]):
+        start = 1
+    for r in rows[start:]:
+        if not r or not r[0].strip():
+            continue
+        name = r[0].strip()
+        dtype = r[1].strip() if len(r) > 1 else "String"
+        comment = r[2].strip() if len(r) > 2 else ""
+        # Punkt-Notation "Motor.Speed" -> Struktur
+        parts = [p.strip() for p in name.split(".") if p.strip()]
+        if len(parts) == 1:
+            members.append({"name": name, "datatype": dtype, "accessible": True,
+                            "writable": True, "comment": comment, "children": []})
+        else:
+            # In Baum einhängen
+            cur = members
+            for i, p in enumerate(parts):
+                found = next((m for m in cur if m["name"] == p), None)
+                if i == len(parts) - 1:
+                    if found:
+                        found["datatype"] = dtype
+                    else:
+                        cur.append({"name": p, "datatype": dtype, "accessible": True,
+                                    "writable": True, "comment": comment, "children": []})
+                else:
+                    if not found:
+                        found = {"name": p, "datatype": "Struct", "accessible": True,
+                                 "writable": True, "comment": "", "children": []}
+                        cur.append(found)
+                    cur = found["children"]
+    return [{"name": path.stem, "members": members, "source": path.name}]
+
+
+# ---------------------------------------------------------------------------
+# 3. NodeSet2.xml aufbauen
+# ---------------------------------------------------------------------------
+
+class NodeIdAllocator:
+    def __init__(self, start=1000):
+        self.next_id = start
+
+    def new(self):
+        nid = self.next_id
+        self.next_id += 1
+        return nid
+
+
+def indent(elem, level=0):
+    """Pretty-Print für ElementTree."""
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+        for child in elem:
+            indent(child, level + 1)
+        if not child.tail or not child.tail.strip():
+            child.tail = i
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = i
+
+
+def build_nodeset(dbs, udts, namespace_uri, plc_name="PLC", version="1.0.0"):
+    NS = "http://opcfoundation.org/UA/2011/03/UANodeSet.xsd"
+    ET.register_namespace("", NS)
+
+    def qn(tag):
+        return f"{{{NS}}}{tag}"
+
+    root = ET.Element(qn("UANodeSet"), {
+        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+        "xmlns:uax": "http://opcfoundation.org/UA/2008/02/Types.xsd",
+    })
+    # NamespaceUris
+    ns_uris = ET.SubElement(root, qn("NamespaceUris"))
+    ET.SubElement(ns_uris, qn("Uri")).text = namespace_uri
+    # Models
+    models = ET.SubElement(root, qn("Models"))
+    pub_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    model = ET.SubElement(models, qn("Model"), {
+        "ModelUri": namespace_uri,
+        "Version": version,
+        "PublicationDate": pub_date,
+    })
+    ET.SubElement(model, qn("RequiredModel"), {
+        "ModelUri": "http://opcfoundation.org/UA/",
+        "Version": "1.05.03",
+        "PublicationDate": "2023-12-15T00:00:00Z",
+    })
+    # Aliases
+    aliases = ET.SubElement(root, qn("Aliases"))
+    for alias, val in ALIASES.items():
+        ET.SubElement(aliases, qn("Alias"), {"Alias": alias}).text = val
+
+    alloc = NodeIdAllocator(start=1000)
+    nsidx = 1
+    udt_nodeids = {}  # udt_name -> nodeid (int)
+
+    def nid_str(nid, ns=nsidx):
+        return f"ns={ns};i={nid}"
+
+    # ---- Root PLC-Objekt ----
+    plc_id = alloc.new()
+    plc_obj = ET.SubElement(root, qn("UAObject"), {
+        "NodeId": nid_str(plc_id), "BrowseName": f"{nsidx}:{plc_name}",
+    })
+    ET.SubElement(plc_obj, qn("DisplayName")).text = plc_name
+    ET.SubElement(plc_obj, qn("Description")).text = f"TIA PLC exportiert als OPC UA Modell ({namespace_uri})"
+    ET.SubElement(plc_obj, qn("References")).text = None
+    refs = plc_obj.find(qn("References"))
+    plc_obj.remove(refs)
+    refs = ET.SubElement(plc_obj, qn("References"))
+    ET.SubElement(refs, qn("Reference"), {"ReferenceType": "Organizes", "IsForward": "false"}).text = "i=85"
+    ET.SubElement(refs, qn("Reference"), {"ReferenceType": "HasTypeDefinition"}).text = "i=58"
+
+    # ---- UDTs als UADataType (Structure) ----
+    for udt in udts:
+        udt_id = alloc.new()
+        udt_nodeids[udt["name"]] = udt_id
+        udt_nodeids[udt["name"].upper()] = udt_id
+        # Auch "UDT_Name" Variante
+        dt_el = ET.SubElement(root, qn("UADataType"), {
+            "NodeId": nid_str(udt_id), "BrowseName": f"{nsidx}:{udt['name']}",
+            "IsAbstract": "false",
+        })
+        ET.SubElement(dt_el, qn("DisplayName")).text = udt["name"]
+        if udt.get("source"):
+            ET.SubElement(dt_el, qn("Description")).text = f"PLC-Datentyp aus {udt['source']}"
+        dt_refs = ET.SubElement(dt_el, qn("References"))
+        ET.SubElement(dt_refs, qn("Reference"), {"ReferenceType": "HasSubtype", "IsForward": "false"}).text = "i=22"
+        # Definition mit Feldern
+        definition = ET.SubElement(dt_el, qn("Definition"), {"Name": udt["name"]})
+        for m in udt["members"]:
+            opc_name, opc_id, is_arr, arr_dim, base = map_datatype(m["datatype"])
+            field = ET.SubElement(definition, qn("Field"), {"Name": m["name"]})
+            # DataType als String-Alias oder ns-Referenz
+            if opc_id:
+                field.set("DataType", opc_id)
+            elif m["datatype"].strip().strip('"') in udt_nodeids or True:
+                # Vorwärtsreferenz auf ggf. noch unbekannten UDT -> ns=1 Name als symbolisch lassen,
+                # SIOME löst über BrowseName auf; wir setzen temporär String
+                field.set("DataType", "i=12")
+            if is_arr:
+                field.set("ValueRank", "1")
+                if arr_dim:
+                    field.set("ArrayDimensions", arr_dim)
+
+    def resolve_datatype_id(siemens_type):
+        opc_name, opc_id, is_arr, arr_dim, base = map_datatype(siemens_type)
+        # UDT?
+        key = (siemens_type or "").strip().strip('"').strip("'")
+        # Array-Basis berücksichtigen
+        m = ARRAY_RE.match(key)
+        if m:
+            key = m.group(3).strip().strip('"').strip("'")
+        if key in udt_nodeids:
+            return (key, nid_str(udt_nodeids[key]), is_arr, arr_dim)
+        if key.upper() in udt_nodeids:
+            return (key, nid_str(udt_nodeids[key.upper()]), is_arr, arr_dim)
+        if opc_id:
+            return (opc_name, opc_id, is_arr, arr_dim)
+        return (opc_name, "i=12", is_arr, arr_dim)
+
+    # ---- DBs als Objekte + Member als Variablen ----
+    def add_members(parent_el, parent_nid, members, db_prefix=""):
+        refs_el = parent_el.find(qn("References"))
+        for m in members:
+            if not m.get("accessible", True):
+                continue  # nicht OPC-UA-sichtbar -> überspringen
+            opc_name, dt_id, is_arr, arr_dim = resolve_datatype_id(m["datatype"])
+            has_children = bool(m.get("children"))
+            is_struct = has_children or opc_name in ("Structure",) or (dt_id.startswith(f"ns={nsidx}") and has_children is False and opc_name not in ALIASES)
+            # UDT ohne inline-Children aber als DataType bekannt -> als Variable mit Struktur-Datatype
+            if has_children or (m["datatype"].strip().lower() == "struct"):
+                # Struct -> UAObject
+                obj_id = alloc.new()
+                obj_el = ET.SubElement(root, qn("UAObject"), {
+                    "NodeId": nid_str(obj_id), "BrowseName": f"{nsidx}:{m['name']}",
+                })
+                ET.SubElement(obj_el, qn("DisplayName")).text = m["name"]
+                if m.get("comment"):
+                    ET.SubElement(obj_el, qn("Description")).text = m["comment"]
+                obj_refs = ET.SubElement(obj_el, qn("References"))
+                ET.SubElement(obj_refs, qn("Reference"), {"ReferenceType": "HasTypeDefinition"}).text = "i=58"
+                # Rückreferenz vom Parent
+                ET.SubElement(refs_el, qn("Reference"), {"ReferenceType": "HasComponent"}).text = nid_str(obj_id)
+                add_members(obj_el, obj_id, m["children"], db_prefix)
+            else:
+                var_id = alloc.new()
+                access = 1  # Read
+                if m.get("writable", True):
+                    access |= 2  # Write
+                attrs = {
+                    "NodeId": nid_str(var_id),
+                    "BrowseName": f"{nsidx}:{m['name']}",
+                    "DataType": dt_id,
+                }
+                if is_arr:
+                    attrs["ValueRank"] = "1"
+                    if arr_dim:
+                        attrs["ArrayDimensions"] = arr_dim
+                else:
+                    attrs["ValueRank"] = "-1"
+                var_el = ET.SubElement(root, qn("UAVariable"), attrs)
+                ET.SubElement(var_el, qn("DisplayName")).text = m["name"]
+                if m.get("comment"):
+                    ET.SubElement(var_el, qn("Description")).text = m["comment"]
+                var_refs = ET.SubElement(var_el, qn("References"))
+                ET.SubElement(var_refs, qn("Reference"), {"ReferenceType": "HasTypeDefinition"}).text = "i=63"
+                ET.SubElement(var_refs, qn("Reference"), {"ReferenceType": "HasComponent", "IsForward": "false"}).text = nid_str(parent_nid)
+                ET.SubElement(var_el, qn("AccessLevel")).text = str(access)
+                ET.SubElement(var_el, qn("UserAccessLevel")).text = str(access)
+                ET.SubElement(var_el, qn("Historizing")).text = "false"
+                ET.SubElement(refs_el, qn("Reference"), {"ReferenceType": "HasComponent"}).text = nid_str(var_id)
+
+    for db in dbs:
+        db_id = alloc.new()
+        # SIOME-Tipp: DB-Name darf keine Leerzeichen für BrowseName enthalten -> ersetzen
+        browse = re.sub(r"\s+", "_", db["name"])
+        db_el = ET.SubElement(root, qn("UAObject"), {
+            "NodeId": nid_str(db_id), "BrowseName": f"{nsidx}:{browse}",
+        })
+        ET.SubElement(db_el, qn("DisplayName")).text = db["name"]
+        ET.SubElement(db_el, qn("Description")).text = f"GlobalDB aus {db.get('source','TIA Export')}"
+        db_refs = ET.SubElement(db_el, qn("References"))
+        ET.SubElement(db_refs, qn("Reference"), {"ReferenceType": "HasTypeDefinition"}).text = "i=58"
+        ET.SubElement(db_refs, qn("Reference"), {"ReferenceType": "HasComponent", "IsForward": "false"}).text = nid_str(plc_id)
+        # Parent-Referenz am PLC-Objekt
+        plc_refs = plc_obj.find(qn("References"))
+        ET.SubElement(plc_refs, qn("Reference"), {"ReferenceType": "HasComponent"}).text = nid_str(db_id)
+        add_members(db_el, db_id, db["members"])
+
+    indent(root)
+    return ET.ElementTree(root)
+
+
+# ---------------------------------------------------------------------------
+# 4. CLI
+# ---------------------------------------------------------------------------
+
+def collect_inputs(input_path: Path):
+    dbs, udts = [], []
+    if input_path.is_dir():
+        files = sorted(list(input_path.glob("*.xml")) + list(input_path.glob("*.XML")))
+        csvs = sorted(list(input_path.glob("*.csv")))
+        if not files and not csvs:
+            print(f"[FEHLER] Keine .xml/.csv Dateien in {input_path} gefunden.", file=sys.stderr)
+            sys.exit(2)
+        for f in files:
+            d, u = parse_tia_file(f)
+            dbs.extend(d)
+            udts.extend(u)
+        for c in csvs:
+            dbs.extend(parse_csv_tags(c))
+    elif input_path.suffix.lower() == ".csv":
+        dbs.extend(parse_csv_tags(input_path))
+    else:
+        d, u = parse_tia_file(input_path)
+        dbs.extend(d)
+        udts.extend(u)
+    return dbs, udts
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="TIA-Portal-Export (XML/CSV) -> OPC UA NodeSet2.xml für SIOME")
+    ap.add_argument("--input", "-i", required=True, help="TIA-XML-Datei, CSV-Datei oder Ordner mit Exporten")
+    ap.add_argument("--output", "-o", required=True, help="Ziel-NodeSet2.xml, z.B. Modell.NodeSet2.xml")
+    ap.add_argument("--namespace", "-n", default="http://siemens.com/tia/my-plant",
+                    help="OPC UA Namespace-URI (in SIOME als Modell-URI sichtbar)")
+    ap.add_argument("--plc-name", default="PLC_1", help="BrowseName des Wurzel-Objekts")
+    ap.add_argument("--version", default="1.0.0", help="Modell-Version")
+    args = ap.parse_args()
+
+    in_path = Path(args.input)
+    if not in_path.exists():
+        print(f"[FEHLER] Input {in_path} existiert nicht.", file=sys.stderr)
+        sys.exit(2)
+
+    dbs, udts = collect_inputs(in_path)
+    print(f"[INFO] {len(dbs)} DB(s), {len(udts)} UDT(s) gefunden.")
+    for db in dbs:
+        print(f"  DB: {db['name']} ({len(db['members'])} Top-Level-Variablen) [{db.get('source','')}]")
+    for u in udts:
+        print(f"  UDT: {u['name']} ({len(u['members'])} Felder) [{u.get('source','')}]")
+
+    if not dbs and not udts:
+        print("[FEHLER] Nichts gefunden. Hinweis: In TIA Portal DB/UDT als XML exportieren "
+              "(Rechtsklick > Exportieren) oder CSV (Name;Datentyp;Kommentar) nutzen.", file=sys.stderr)
+        sys.exit(3)
+
+    tree = build_nodeset(dbs, udts, args.namespace, plc_name=args.plc_name, version=args.version)
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(str(out), encoding="utf-8", xml_declaration=True)
+    print(f"[OK] NodeSet geschrieben: {out}")
+    print(f"     Namespace: {args.namespace}")
+    print("     Nächster Schritt: SIOME > Import XML > diese Datei wählen.")
+
+
+if __name__ == "__main__":
+    main()
